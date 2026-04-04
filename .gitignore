@@ -1,0 +1,13 @@
+node_modules/
+.env
+*.log
+build/
+dist/
+.DS_Store
+backend/node_modules/
+frontend/node_modules/
+contract/node_modules/
+contract/artifacts/
+contract/cache/
+backend/data/store.json
+node_modules_backup_20260404_1730/
