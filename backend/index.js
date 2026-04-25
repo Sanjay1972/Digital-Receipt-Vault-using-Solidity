@@ -142,6 +142,21 @@ const initDb = async () => {
         )
       `);
 
+      // Backfill columns for databases created before newer publish metadata existed.
+      await client.query(`
+        ALTER TABLE receipts
+        ADD COLUMN IF NOT EXISTS batch_issued_at BIGINT
+      `);
+
+      await client.query(`
+        ALTER TABLE batches
+        ADD COLUMN IF NOT EXISTS batch_issued_at BIGINT,
+        ADD COLUMN IF NOT EXISTS leaf_count INTEGER,
+        ADD COLUMN IF NOT EXISTS tx_hash TEXT,
+        ADD COLUMN IF NOT EXISTS committed_at BIGINT,
+        ADD COLUMN IF NOT EXISTS receipt_ids TEXT[]
+      `);
+
       await client.query("COMMIT");
       console.log("PostgreSQL Database Initialized");
     } catch (err) {
@@ -249,6 +264,7 @@ const createClaimLink = (claimId) =>
 
 const summarizeReceipt = (receipt) => ({
   claimId: receipt.claim_id,
+  receiptId: receipt.claim_id,
   batchId: receipt.batch_id ?? null,
   cid: receipt.cid,
   receiptHash: receipt.receipt_hash,
@@ -256,6 +272,7 @@ const summarizeReceipt = (receipt) => ({
   issuer: receipt.issuer,
   companyName: receipt.company_name,
   email: receipt.email,
+  fileName: receipt.file_name ?? null,
   issuedAt: receipt.issued_at ?? null,
   createdAt: receipt.created_at,
   status: receipt.status,
@@ -268,9 +285,12 @@ const summarizeReceipt = (receipt) => ({
   otpPreview: receipt.email ? "Sent to customer email after batch publish" : receipt.otp_plain,
 });
 
+const byNormalizedAddress = (columnName, paramIndex = 1) =>
+  `LOWER(${columnName}) = LOWER($${paramIndex})`;
+
 const getBatchPayload = async (issuer, timestampOverride) => {
   const res = await pool.query(
-    "SELECT * FROM receipts WHERE issuer = $1 AND status = 'pending'",
+    `SELECT * FROM receipts WHERE ${byNormalizedAddress("issuer")} AND status = 'pending'`,
     [issuer]
   );
   const pendingReceipts = res.rows;
@@ -462,18 +482,21 @@ app.get("/company/:issuer/dashboard", async (req, res) => {
     const issuer = req.params.issuer?.toLowerCase();
     if (!issuer || !ethers.isAddress(issuer)) return res.status(400).json({ error: "Invalid issuer" });
 
-    const issuerRes = await pool.query("SELECT * FROM issuers WHERE address = $1", [issuer]);
+    const issuerRes = await pool.query(
+      `SELECT * FROM issuers WHERE ${byNormalizedAddress("address")}`,
+      [issuer]
+    );
     const issuerData = issuerRes.rows[0] || { company_name: "" };
     
     const batchPreview = await getBatchPayload(issuer);
     
     const committedBatchesRes = await pool.query(
-      "SELECT * FROM batches WHERE issuer = $1 ORDER BY committed_at DESC",
+      `SELECT * FROM batches WHERE ${byNormalizedAddress("issuer")} ORDER BY committed_at DESC`,
       [issuer]
     );
 
     const issuedReceiptsRes = await pool.query(
-      "SELECT * FROM receipts WHERE issuer = $1 ORDER BY created_at DESC",
+      `SELECT * FROM receipts WHERE ${byNormalizedAddress("issuer")} ORDER BY created_at DESC`,
       [issuer]
     );
 
@@ -550,7 +573,12 @@ app.post("/company/commit-batch", async (req, res) => {
     }
 
     await client.query("COMMIT");
-    res.json({ ok: true, batchId });
+    res.json({
+      ok: true,
+      batchId,
+      receiptCount: currentBatch.receipts.length,
+      receipts: currentBatch.receipts.map(summarizeReceipt),
+    });
   } catch (err) {
     await client.query("ROLLBACK");
     res.status(500).json({ error: err.message });
@@ -619,8 +647,8 @@ app.get("/user/:wallet/receipts", async (req, res) => {
     const result = await pool.query(
       `SELECT r.*, i.company_name as issuer_company_name 
        FROM receipts r 
-       LEFT JOIN issuers i ON r.issuer = i.address 
-       WHERE r.claimed_by = $1 
+       LEFT JOIN issuers i ON LOWER(r.issuer) = LOWER(i.address) 
+       WHERE ${byNormalizedAddress("r.claimed_by")} 
        ORDER BY r.claimed_at DESC`,
       [wallet]
     );
